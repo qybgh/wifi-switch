@@ -285,11 +285,14 @@ private func connect(ssid: String) {
         ["-setairportnetwork", interface, ssid, password]
     )
     let message = output.trimmingCharacters(in: .whitespacesAndNewlines)
-    if status != 0 ||
-        message.localizedCaseInsensitiveContains("Failed to join") ||
-        message.localizedCaseInsensitiveContains("Could not find network")
-    {
+    if status != 0 || message.localizedCaseInsensitiveContains("Could not find network") {
         fail(message.isEmpty ? "networksetup failed" : message, code: .network)
+    }
+    if message.localizedCaseInsensitiveContains("Failed to join") {
+        fail(
+            "failed to join \(ssid). This is most often a password/authentication problem; check the saved password with `\(toolName) set \"\(ssid)\"`. networksetup said: \(message)",
+            code: .network
+        )
     }
 
     Thread.sleep(forTimeInterval: 3)
