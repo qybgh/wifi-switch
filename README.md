@@ -123,3 +123,30 @@ make check
 ## License
 
 MIT
+
+## Observability
+
+Inspect the current state without switching:
+
+```sh
+wifi-switch status
+```
+
+Example output:
+
+```text
+interface: en0
+active: true
+ssid: My Wi-Fi
+bssid: a2:9f:...
+security: WPA2_PSK
+ipv4: 192.168.1.20
+gateway: 192.168.1.1
+```
+
+macOS can redact the SSID from system status commands depending on privacy
+settings and calling context. When that happens, `wifi-switch` compares the
+current radio channel with channels observed for the target SSID. A channel
+match is treated as "likely connected" and is sufficient for the idempotent
+repeat-switch path. A successful switch reports `(confirmed)` when the target
+SSID was actually observed.

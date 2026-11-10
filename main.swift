@@ -1,4 +1,5 @@
 import Foundation
+import CoreWLAN
 import Security
 
 private let toolName = "wifi-switch"
@@ -23,6 +24,7 @@ private func usage() -> Never {
         """
         Usage:
           \(toolName) list
+          \(toolName) status
           \(toolName) set <SSID>
           \(toolName) forget <SSID>
           \(toolName) <SSID>
@@ -84,19 +86,81 @@ private func currentNetwork(interface: String) -> String? {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-private func networkFingerprint(interface: String) -> String {
+private struct Observation {
+    let ssid: String?
+    let bssid: String?
+    let security: String?
+    let ipv4: String?
+    let gateway: String?
+    let channel: Int?
+    let active: Bool
+
+    var fingerprint: String {
+        "\(ipv4 ?? "")|\(gateway ?? "")|\(bssid ?? "")"
+    }
+}
+
+private func redacted(_ value: String) -> Bool {
+    value == "<redacted>" || value.isEmpty
+}
+
+private func observe(interface: String) -> Observation {
+    let (_, summary) = run("/usr/sbin/ipconfig", ["getsummary", interface])
+
+    func field(_ key: String) -> String? {
+        for line in summary.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("\(key) :") {
+                let value = trimmed.dropFirst("\(key) :".count)
+                    .trimmingCharacters(in: .whitespaces)
+                return redacted(value) ? nil : value
+            }
+        }
+        return nil
+    }
+
+    let ssid = field("SSID")
+    let bssid = field("BSSID")
+    let security = field("Security")
+    let router = field("Router")
     let (_, address) = run("/usr/sbin/ipconfig", ["getifaddr", interface])
-    let (_, route) = run("/sbin/route", ["-n", "get", "default"])
-    let gateway = route.components(separatedBy: .newlines)
-        .first { $0.trimmingCharacters(in: .whitespaces).hasPrefix("gateway:") }?
-        .trimmingCharacters(in: .whitespaces) ?? ""
-    let (_, profile) = run("/usr/sbin/system_profiler", ["SPAirPortDataType", "-json"])
-    let channel = profile.components(separatedBy: "\"spairport_network_channel\":\"")
-        .dropFirst()
-        .first?
-        .components(separatedBy: "\"")
-        .first ?? ""
-    return "\(address.trimmingCharacters(in: .whitespacesAndNewlines))|\(gateway)|\(channel)"
+    let ipv4 = address.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    let (_, status) = run("/usr/sbin/networksetup", ["-getairportpower", interface])
+    let powered = status.trimmingCharacters(in: .whitespacesAndNewlines).contains(": On")
+    let coreChannel = CWWiFiClient.shared().interface(withName: interface)?
+        .wlanChannel()?.channelNumber
+
+    return Observation(
+        ssid: ssid ?? currentNetwork(interface: interface),
+        bssid: bssid,
+        security: security,
+        ipv4: ipv4.isEmpty ? nil : ipv4,
+        gateway: router,
+        channel: coreChannel,
+        active: powered && !ipv4.isEmpty
+    )
+}
+
+private func targetChannels(for ssid: String, on interface: String) -> Set<Int>? {
+    guard let core = CWWiFiClient.shared().interface(withName: interface) else {
+        return nil
+    }
+    let networks: Set<CWNetwork>
+    do {
+        networks = try core.scanForNetworks(withName: ssid, includeHidden: true)
+    } catch {
+        return nil
+    }
+    let channels = Set(networks.compactMap { $0.wlanChannel?.channelNumber })
+    return channels.isEmpty ? nil : channels
+}
+
+private func likelyConnected(to ssid: String, observation: Observation, interface: String) -> Bool {
+    guard let channel = observation.channel else {
+        return false
+    }
+    return targetChannels(for: ssid, on: interface)?.contains(channel) == true
 }
 
 private func keychainQuery(for ssid: String) -> [CFString: Any] {
@@ -208,7 +272,14 @@ private func connect(ssid: String) {
     }
 
     let interface = detectWiFiInterface()
-    let before = networkFingerprint(interface: interface)
+    let initial = observe(interface: interface)
+    if initial.ssid == ssid || likelyConnected(to: ssid, observation: initial, interface: interface) {
+        print("Already connected to \(ssid) using \(interface).")
+        return
+    }
+
+    let before = initial.fingerprint
+
     let (status, output) = run(
         "/usr/sbin/networksetup",
         ["-setairportnetwork", interface, ssid, password]
@@ -223,19 +294,29 @@ private func connect(ssid: String) {
 
     Thread.sleep(forTimeInterval: 3)
     let deadline = Date().addingTimeInterval(12)
+    var sawTargetSSID = false
+    var sawChangedFingerprint = false
     while Date() < deadline {
-        let associated = currentNetwork(interface: interface)
-        let after = networkFingerprint(interface: interface)
-        let changed = !after.isEmpty && after != before
-        // On macOS 15 the current SSID can be hidden, and joining the same
-        // SSID leaves the fingerprint unchanged. Treat a stable, unchanged
-        // network as already connected; a real failed join reports an error
-        // above.
-        if associated == ssid || changed || after == before {
-            print("Connected to \(ssid) using \(interface).")
+        let after = observe(interface: interface)
+        if after.ssid == ssid {
+            sawTargetSSID = true
+        }
+        if likelyConnected(to: ssid, observation: after, interface: interface) {
+            sawTargetSSID = true
+        }
+        if after.fingerprint != before {
+            sawChangedFingerprint = true
+        }
+        if after.ssid == ssid || sawChangedFingerprint {
+            let confidence = sawTargetSSID ? "confirmed" : "changed"
+            print("Connected to \(ssid) using \(interface) (\(confidence)).")
             return
         }
         Thread.sleep(forTimeInterval: 0.5)
+    }
+    let final = observe(interface: interface)
+    if final.active, final.fingerprint == before {
+        fail("join was not observed; the link stayed on the previous network", code: .verification)
     }
     fail("networksetup did not report an error, but \(ssid) was not confirmed within 15 seconds", code: .verification)
 }
@@ -253,6 +334,19 @@ case "list":
         fail("usage: \(toolName) list", code: .usage)
     }
     listSaved()
+case "status":
+    guard args.count == 1 else {
+        fail("usage: \(toolName) status", code: .usage)
+    }
+    let interface = detectWiFiInterface()
+    let state = observe(interface: interface)
+    print("interface: \(interface)")
+    print("active: \(state.active)")
+    print("ssid: \(state.ssid ?? "<unavailable>")")
+    print("bssid: \(state.bssid ?? "<unavailable>")")
+    print("security: \(state.security ?? "<unavailable>")")
+    print("ipv4: \(state.ipv4 ?? "<unavailable>")")
+    print("gateway: \(state.gateway ?? "<unavailable>")")
 case "set":
     guard args.count == 2 else {
         fail("usage: \(toolName) set <SSID>", code: .usage)
