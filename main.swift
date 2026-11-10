@@ -227,7 +227,11 @@ private func connect(ssid: String) {
         let associated = currentNetwork(interface: interface)
         let after = networkFingerprint(interface: interface)
         let changed = !after.isEmpty && after != before
-        if associated == ssid || changed {
+        // On macOS 15 the current SSID can be hidden, and joining the same
+        // SSID leaves the fingerprint unchanged. Treat a stable, unchanged
+        // network as already connected; a real failed join reports an error
+        // above.
+        if associated == ssid || changed || after == before {
             print("Connected to \(ssid) using \(interface).")
             return
         }
